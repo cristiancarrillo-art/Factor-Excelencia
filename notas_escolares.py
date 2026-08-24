@@ -167,21 +167,31 @@ def evaluar_periodos_literales(df_notas, mapa_grados):
     resultados_periodos = []
     
     for p in periodos_definicion:
-        grados_a_evaluar = [g for g in p["grados"] if g in mapa_grados]
-        
+        grados_requeridos = p["grados"]
+        grados_completos = True
         total_notas = 0
-        notas_excelencia = 0  # Cantidad de calificativos 'A' o 'AD'
+        notas_excelencia = 0
         
         if df_notas is not None and not df_notas.empty:
-            for g in grados_a_evaluar:
+            for g in grados_requeridos:
+                # Se verifica si el grado existe y posee calificativos válidos (A, AD, B, C)
                 if g in df_notas.columns:
-                    for nota in df_notas[g]:
-                        if nota in ["A", "AD", "B", "C"]:
-                            total_notas += 1
-                            if nota in ["A", "AD"]:
-                                notas_excelencia += 1
-                                
-        if total_notas > 0:
+                    notas_grado = [n for n in df_notas[g] if n in ["A", "AD", "B", "C"]]
+                    if len(notas_grado) == 0:
+                        grados_completos = False  # El grado no tiene notas registradas
+                    else:
+                        total_notas += len(notas_grado)
+                        notas_excelencia += sum(1 for n in notas_grado if n in ["A", "AD"])
+                else:
+                    grados_completos = False
+        else:
+            grados_completos = False
+
+        # Evaluación del estado según completitud de los grados
+        if not grados_completos:
+            porcentaje = round((notas_excelencia / total_notas) * 100, 2) if total_notas > 0 else 0.0
+            estado = "NO CUMPLE (INCOMPLETO)"
+        elif total_notas > 0:
             porcentaje = round((notas_excelencia / total_notas) * 100, 2)
             estado = "CUMPLE" if porcentaje >= 90.0 else "NO CUMPLE"
         else:
@@ -194,7 +204,7 @@ def evaluar_periodos_literales(df_notas, mapa_grados):
             "Notas A o AD": notas_excelencia,
             "Porcentaje": f"{porcentaje}%",
             "ESTADO": estado,
-            "_porcentaje_num": porcentaje
+            "_porcentaje_num": porcentaje if estado == "CUMPLE" else 0.0
         })
         
     return pd.DataFrame(resultados_periodos)

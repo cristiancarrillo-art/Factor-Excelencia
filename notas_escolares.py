@@ -6,6 +6,7 @@ import streamlit as st
 import base64
 import pdfplumber
 import re
+from datetime import datetime
 from streamlit_option_menu import option_menu
 import sys
 import asyncio
@@ -91,20 +92,57 @@ def procesar_constancia_literal(file_bytes):
             linea = m2.group(1).strip()
             nombre = re.sub(r".*?estudiante\s+", "", linea, flags=re.IGNORECASE).strip()
 
-    # 3. Mapeo Dinámico de Columnas de Grados
+    # 3. Mapeo Dinámico de Columnas de Grados y Año Lectivo
     mapa_columnas = {}
+    anios_lectivos = {}
     for fila in todas_las_filas:
-        if fila and any("1.°" in str(celda) for celda in fila if celda):
-            for idx, celda in enumerate(fila):
-                celda_limpia = str(celda).strip().replace("\n", " ")
-                if any(g in celda_limpia for g in ["1.°", "2.", "3.°", "4.°", "5.°"]):
-                    if "1" in celda_limpia: grado = "1.°"
-                    elif "2" in celda_limpia: grado = "2.°"
-                    elif "3" in celda_limpia: grado = "3.°"
-                    elif "4" in celda_limpia: grado = "4.°"
-                    elif "5" in celda_limpia: grado = "5.°"
-                    mapa_columnas[grado] = idx
-            break
+        if not fila:
+            continue
+        fila_limpia = [
+            str(celda).strip().replace("\n", " ") if celda else ""
+            for celda in fila
+        ]
+        texto_fila = " ".join(fila_limpia).upper()
+        # ---------------------------------------------------------
+        # Detectar fila "Año lectivo"
+        # ---------------------------------------------------------
+        if "AÑO LECTIVO" in texto_fila:
+            anios_detectados = []
+            for idx, celda in enumerate(fila_limpia):
+                # Buscar un año de 4 dígitos
+                match_anio = re.search(r"\b(20\d{2})\b", celda)
+                if match_anio:
+                    anios_detectados.append(
+                        (idx, int(match_anio.group(1)))
+                    )
+            # Guardamos el año asociado a cada posición de columna
+            for idx, anio in anios_detectados:
+                anios_lectivos[idx] = anio
+
+        # ---------------------------------------------------------
+        # Detectar fila "Grado"
+        # ---------------------------------------------------------
+        if any(g in texto_fila for g in ["1.°", "2.°", "3.°", "4.°", "5.°"]):
+            for idx, celda in enumerate(fila_limpia):
+                if "1.°" in celda:
+                    mapa_columnas["1.°"] = idx
+                elif "2.°" in celda:
+                    mapa_columnas["2.°"] = idx
+                elif "3.°" in celda:
+                    mapa_columnas["3.°"] = idx
+                elif "4.°" in celda:
+                    mapa_columnas["4.°"] = idx
+                elif "5.°" in celda:
+                    mapa_columnas["5.°"] = idx
+            if len(mapa_columnas) >= 5:
+                break
+
+    anio_egreso = None
+    if "5.°" in mapa_columnas:
+        columna_5 = mapa_columnas["5.°"]
+        # Buscar el año lectivo correspondiente a la columna de 5.°
+        if columna_5 in anios_lectivos:
+            anio_egreso = anios_lectivos[columna_5]
 
     # 4. Extracción y Limpieza de la Matriz de Notas
     area_actual = None
@@ -152,7 +190,7 @@ def procesar_constancia_literal(file_bytes):
             registro_notas.append(diccionario_fila)
 
     df_notas = pd.DataFrame(registro_notas)
-    return dni, nombre, mapa_columnas, df_notas
+    return dni, nombre, mapa_columnas, df_notas, anio_egreso
 
 # =========================================================================
 # LÓGICA DE EVALUACIÓN DE REQUISITOS (LITERALES - 90% MÍNIMO A/AD)
@@ -209,6 +247,33 @@ def evaluar_periodos_literales(df_notas, mapa_grados):
         
     return pd.DataFrame(resultados_periodos)
 
+def evaluar_antiguedad_egreso(anio_egreso):
+    anio_actual = datetime.now().year
+    anio_minimo = anio_actual - 2
+
+    # Sin año de egreso = estudiante aún cursando 5.°
+    if anio_egreso is None:
+        return {
+            "Cumple": True,
+            "AnioEgreso": None,
+            "AnioActual": anio_actual,
+            "AnioMinimo": anio_minimo,
+            "Mensaje": "En curso (5.° de secundaria)"
+        }
+
+    cumple = anio_egreso >= anio_minimo
+
+    return {
+        "Cumple": cumple,
+        "AnioEgreso": anio_egreso,
+        "AnioActual": anio_actual,
+        "AnioMinimo": anio_minimo,
+        "Mensaje": (
+            f"Egreso {anio_egreso}"
+            if cumple
+            else f"Egreso {anio_egreso} — excede el máximo permitido"
+        )
+    }
 
 def main():    
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -278,14 +343,15 @@ def main():
         progress_bar.progress((i + 1) / n, f"Analizando documento {i + 1} de {n}...")
         try:
             file_bytes = file.read()
-            dni, nombre, mapa_grados, df_notas = procesar_constancia_literal(file_bytes)
+            dni, nombre, mapa_grados, df_notas,anio_egreso = procesar_constancia_literal(file_bytes)
             df_periodos = evaluar_periodos_literales(df_notas, mapa_grados)
             
             dict_estudiantes[dni] = {
                 "Nombre": nombre,
                 "MatrizNotas": df_notas,
                 "Periodos": df_periodos,
-                "MapaGrados": mapa_grados
+                "MapaGrados": mapa_grados,
+                "AnioEgreso": anio_egreso
             }
             last_dni = dni
         except Exception as e:
@@ -311,12 +377,48 @@ def main():
             df_mostrar_periodos = estudiante_actual['Periodos'].drop(columns=['_porcentaje_num'])
             st.dataframe(df_mostrar_periodos, use_container_width=True)
             
-            # Criterio de Aprobación: Si cumple en CUALQUIERA de los periodos válidos, se considera Apto.
-            aplica = (estudiante_actual['Periodos']['ESTADO'] == 'CUMPLE').any()
-            if aplica:
-                st.success("🎉 El estudiante APLICA y es APTO para la modalidad Factor Excelencia.")
+            # Evaluación de condiciones
+
+            # Condición académica:
+            # Debe cumplir en al menos uno de los periodos evaluados.
+            periodo_1_4 = estudiante_actual['Periodos'][estudiante_actual['Periodos']['Periodo'] == '1.° a 4.° de Secundaria']
+            tiene_hasta_4to = (not periodo_1_4.empty and periodo_1_4.iloc[0]['ESTADO'] != 'NO CUMPLE (INCOMPLETO)')
+            cumple_porcentaje = (estudiante_actual['Periodos']['ESTADO'] == 'CUMPLE').any()
+            cumple_notas = tiene_hasta_4to and cumple_porcentaje
+
+            # Condición de antigüedad:
+            resultado_egreso = evaluar_antiguedad_egreso(estudiante_actual["AnioEgreso"])
+            cumple_antiguedad = resultado_egreso["Cumple"]
+
+            # Mostrar condición de año de egreso
+            if resultado_egreso["AnioEgreso"] is None:
+                st.info("🎓 Año de egreso: EN CURSO — el estudiante aún está cursando 5.° de secundaria.")
             else:
-                st.error("❌ El estudiante NO APLICA para esta modalidad de admisión (No alcanza el 90% mínimo de notas A o AD).")
+                st.write(f"🎓 **Año de egreso:** {resultado_egreso['AnioEgreso']}")
+
+                if cumple_antiguedad:
+                    st.success(
+                        f"✅ Antigüedad de egreso: CUMPLE "
+                        f"(mínimo permitido: {resultado_egreso['AnioMinimo']})"
+                    )
+                else:
+                    st.error(
+                        f"❌ Antigüedad de egreso: NO CUMPLE. "
+                        f"El egreso debe ser desde {resultado_egreso['AnioMinimo']}."
+                    )
+
+            # Condición final
+            aplica = cumple_notas and cumple_antiguedad
+            if aplica:
+                st.success(
+                    "🎉 El estudiante APLICA y es APTO para la modalidad Factor Excelencia.")
+            else:
+                if not tiene_hasta_4to:
+                    st.error("❌ El estudiante NO APLICA porque no registra información académica hasta 4.° grado de secundaria.")
+                elif not cumple_antiguedad:
+                    st.error("❌ El estudiante NO APLICA debido a que su año de egreso excede la antigüedad permitida.")
+                elif not cumple_porcentaje:
+                    st.error("❌ El estudiante NO APLICA porque no alcanza el 90% mínimo de notas A o AD.")
             
             # Exportador a Excel unificado
             buffer = io.BytesIO()
@@ -324,12 +426,18 @@ def main():
                 summary_data = []
                 for k, v in dict_estudiantes.items():
                     mejor_periodo = v['Periodos'].loc[v['Periodos']['_porcentaje_num'].idxmax()]
+                    cumple_notas = (v['Periodos']['ESTADO'] == 'CUMPLE').any()
+                    resultado_egreso = evaluar_antiguedad_egreso(v["AnioEgreso"])
+                    cumple_antiguedad = resultado_egreso["Cumple"]
                     summary_data.append({
                         "DNI": k,
                         "Nombre": v['Nombre'],
+                        "Año de Egreso": (v["AnioEgreso"] if v["AnioEgreso"] is not None else "EN CURSO"),
+                        "Condición Año de Egreso": ( "CUMPLE" if cumple_antiguedad else "NO CUMPLE"),
                         "Periodo Óptimo": mejor_periodo['Periodo'],
                         "Porcentaje Máximo": mejor_periodo['Porcentaje'],
-                        "Condición Final": "APTO" if (v['Periodos']['ESTADO'] == 'CUMPLE').any() else "NO APTO"
+                        "Condición Notas": ("CUMPLE" if cumple_notas else "NO CUMPLE"),
+                        "Condición Final": ("APTO" if cumple_notas and cumple_antiguedad else "NO APTO")
                     })
                 pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name="Resumen")
             st.download_button("📥 Descargar Reporte Consolidado (.xlsx)", data=buffer.getvalue(), file_name="Resultado_Evaluacion.xlsx", mime="application/vnd.ms-excel")
